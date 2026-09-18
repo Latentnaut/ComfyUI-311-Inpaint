@@ -92,6 +92,23 @@ def tensor2batch(t: torch.Tensor, bs: torch.Size) -> torch.Tensor:
     elif dim == 4:
         return tensor2rgba(t)
 
+def resample_image(image: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """
+    Resize IMAGE [B,H,W,C] (or [H,W,C] via unsqueeze at call site).
+    Identity if size already matches. Lanczos (same path as Add Margins 311)
+    instead of raw bicubic, which aliases on downscale (jagged paste).
+    """
+    height = max(1, int(height))
+    width = max(1, int(width))
+    if image.shape[-3] == height and image.shape[-2] == width:
+        return image
+    import comfy.utils
+    out = comfy.utils.common_upscale(
+        image.movedim(-1, 1), width, height, "lanczos", "disabled"
+    ).movedim(1, -1)
+    return out.clamp(0.0, 1.0)
+
+
 def tensors2common(t1: torch.Tensor, t2: torch.Tensor) -> (torch.Tensor, torch.Tensor):
     t1s = t1.size()
     t2s = t2.size()
@@ -783,8 +800,7 @@ class CutByMask:
                 xmin = int(min_x[i].item())
                 xmax = int(max_x[i].item())
                 single = (image[i, ymin:ymax+1, xmin:xmax+1,:]).unsqueeze(0)
-                resized = torch.nn.functional.interpolate(single.permute(0, 3, 1, 2), size=(use_height, use_width), mode='bicubic').permute(0, 2, 3, 1)
-                result[i] = resized[0]
+                result[i] = resample_image(single, use_height, use_width)[0]
 
         # Preserve our type unless we were previously RGB and added non-opaque alpha due to the mask size
         if C == 1:
@@ -917,11 +933,6 @@ class PasteByMask:
         min_y = boxes[:,1]
         max_x = boxes[:,2]
         max_y = boxes[:,3]
-        mid_x = (min_x + max_x) / 2
-        mid_y = (min_y + max_y) / 2
-
-        target_width = max_x - min_x + 1
-        target_height = max_y - min_y + 1
 
         result = image_base.detach().clone()
         for i in range(0, MB):
@@ -931,12 +942,19 @@ class PasteByMask:
                 image_index = i
                 if mask_mapping_optional is not None:
                     image_index = mask_mapping_optional[i].item()
-                source_size = image_to_paste.size()
                 SB, SH, SW, _ = image_to_paste.shape
 
+                # Inclusive masks_to_boxes → exclusive slice, matching Cut By Mask
+                box_xmin = int(min_x[i].item())
+                box_ymin = int(min_y[i].item())
+                box_xmax = int(max_x[i].item()) + 1
+                box_ymax = int(max_y[i].item()) + 1
+                bbox_w = max(1, box_xmax - box_xmin)
+                bbox_h = max(1, box_ymax - box_ymin)
+
                 # Figure out the desired size
-                width = int(target_width[i].item())
-                height = int(target_height[i].item())
+                width = bbox_w
+                height = bbox_h
                 if resize_behavior == "keep_ratio_fill":
                     target_ratio = width / height
                     actual_ratio = SW / SH
@@ -955,18 +973,23 @@ class PasteByMask:
                     width = SW
                     height = SH
 
-                # Resize the image we're pasting if needed
-                resized_image = image_to_paste[i].unsqueeze(0)
-                if SH != height or SW != width:
-                    resized_image = torch.nn.functional.interpolate(resized_image.permute(0, 3, 1, 2), size=(height,width), mode='bicubic').permute(0, 2, 3, 1)
+                width = max(1, int(width))
+                height = max(1, int(height))
+
+                # Resize the image we're pasting if needed (lanczos; skip if already exact)
+                paste_idx = i if i < SB else 0
+                resized_image = resample_image(image_to_paste[paste_idx].unsqueeze(0), height, width)
 
                 pasting = torch.ones([H, W, C], device=image_base.device)
-                ymid = float(mid_y[i].item())
-                ymin = int(math.floor(ymid - height / 2)) + 1
-                ymax = int(math.floor(ymid + height / 2)) + 1
-                xmid = float(mid_x[i].item())
-                xmin = int(math.floor(xmid - width / 2)) + 1
-                xmax = int(math.floor(xmid + width / 2)) + 1
+                if resize_behavior == "resize":
+                    xmin, ymin, xmax, ymax = box_xmin, box_ymin, box_xmax, box_ymax
+                else:
+                    xmid = (box_xmin + box_xmax) / 2.0
+                    ymid = (box_ymin + box_ymax) / 2.0
+                    xmin = int(round(xmid - width / 2.0))
+                    ymin = int(round(ymid - height / 2.0))
+                    xmax = xmin + width
+                    ymax = ymin + height
 
                 _, source_ymax, source_xmax, _ = resized_image.shape
                 source_ymin, source_xmin = 0, 0

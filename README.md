@@ -46,6 +46,8 @@ These nodes keep the original workflow type ids, so existing graphs load without
 
 Do not run a second pack that registers the same type ids.
 
+`Paste By Mask` / `Cut By Mask` resample with **lanczos** (same path as Add Margins 311). Same-size cut→paste is a 1:1 copy. Default `resize` still fits the paste into the mask bounding box; it no longer uses raw bicubic (that aliased on downscale).
+
 | Search title | Workflow type id |
 |--------------|------------------|
 | Paste By Mask 311 | `Paste By Mask` |
