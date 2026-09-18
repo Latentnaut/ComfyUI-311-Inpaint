@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-311-inpaint"
-description = "Inpaint helper nodes for ComfyUI (311 series). First node: Add Margins — pad an image and its mask with extra width/height, centered on a configurable fill color."
-version = "1.0.0"
+description = "Inpaint helper nodes for ComfyUI (311 series): Add Margins plus drop-in mask/compositing nodes (Paste By Mask, Cut By Mask, and related ops)."
+version = "1.1.0"
 license = "MIT"
 
 [project.urls]

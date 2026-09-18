@@ -2,11 +2,16 @@
 Add Margins 311 — pad an image and its mask with configurable margins.
 
 Size modes:
-  - square_longest (default): black 1:1 canvas = longest_side * scale_by (1.25),
+  - square_longest (default): 1:1 canvas = longest_side * scale_by (1.25),
     content centered — matches ImageSize(Longest) → ScaleByAspectRatio(1:1) →
     Upscale By(1.25) → Image Align(center).
   - add_margins: expand by symmetric extras or custom per-side (px/%).
   - target_size: fit (contain) onto an absolute canvas.
+
+Fill modes:
+  - color (default): solid fill_color in the margin
+  - tile: repeat image (circular pad) — F.pad, no full-image clones
+  - mirror: reflect edges for visual continuity (chunked if pad >= dim)
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from __future__ import annotations
 import re
 
 import torch
+import torch.nn.functional as F
 import comfy.utils
 from comfy_api.latest import io
 
@@ -114,7 +120,7 @@ def _resize_mask(mask: torch.Tensor, new_h: int, new_w: int) -> torch.Tensor:
     """Resize MASK [B,H,W] with bilinear."""
     if mask.shape[1] == new_h and mask.shape[2] == new_w:
         return mask
-    return torch.nn.functional.interpolate(
+    return F.interpolate(
         mask.unsqueeze(1),
         size=(new_h, new_w),
         mode="bilinear",
@@ -130,28 +136,114 @@ def _side_to_pixels(value: int | float, unit: str, base: int) -> int:
     return max(0, int(round(v)))
 
 
-def _paste(
+def _reflect_pad_axis(x: torch.Tensor, before: int, after: int, dim: int) -> torch.Tensor:
+    """
+    Reflect-pad along one spatial dim of BCHW tensor.
+    PyTorch reflect requires pad < size; pad in chunks of (size - 1) when needed.
+    """
+    before = max(0, int(before))
+    after = max(0, int(after))
+    if before == 0 and after == 0:
+        return x
+
+    # dim: 2 = H, 3 = W
+    while before > 0 or after > 0:
+        size = x.shape[dim]
+        if size <= 1:
+            # Degenerate: fall back to replicate (edge pixels)
+            pad = [0, 0, 0, 0]
+            if dim == 3:
+                pad[0], pad[1] = before, after
+            else:
+                pad[2], pad[3] = before, after
+            return F.pad(x, tuple(pad), mode="replicate")
+
+        max_chunk = size - 1
+        b = min(before, max_chunk)
+        a = min(after, max_chunk)
+        pad = [0, 0, 0, 0]
+        if dim == 3:
+            pad[0], pad[1] = b, a
+        else:
+            pad[2], pad[3] = b, a
+        x = F.pad(x, tuple(pad), mode="reflect")
+        before -= b
+        after -= a
+    return x
+
+
+def _reflect_pad_safe(
+    x_bchw: torch.Tensor, pad_l: int, pad_r: int, pad_t: int, pad_b: int
+) -> torch.Tensor:
+    """Reflect-pad BCHW with arbitrary pad sizes (chunked if pad >= dim)."""
+    x = _reflect_pad_axis(x_bchw, pad_t, pad_b, dim=2)
+    x = _reflect_pad_axis(x, pad_l, pad_r, dim=3)
+    return x
+
+
+def _pad_image(
+    image_bhwc: torch.Tensor,
+    pad_l: int,
+    pad_r: int,
+    pad_t: int,
+    pad_b: int,
+    fill_mode: str,
+    fill_color: str,
+) -> torch.Tensor:
+    """
+    Pad IMAGE [B,H,W,C] using color fill, circular tile, or mirror reflect.
+    Tile/mirror use F.pad — materializes only the final canvas, no N full clones.
+    """
+    pad_l = max(0, int(pad_l))
+    pad_r = max(0, int(pad_r))
+    pad_t = max(0, int(pad_t))
+    pad_b = max(0, int(pad_b))
+    if pad_l == 0 and pad_r == 0 and pad_t == 0 and pad_b == 0:
+        return image_bhwc
+
+    mode = (fill_mode or "color").strip().lower()
+    batch, height, width, channels = image_bhwc.shape
+
+    if mode == "tile":
+        x = image_bhwc.movedim(-1, 1)  # BCHW
+        return F.pad(x, (pad_l, pad_r, pad_t, pad_b), mode="circular").movedim(1, -1)
+
+    if mode == "mirror":
+        x = image_bhwc.movedim(-1, 1)
+        return _reflect_pad_safe(x, pad_l, pad_r, pad_t, pad_b).movedim(1, -1)
+
+    # color
+    fill = _fill_vector(channels, fill_color)
+    canvas_h = height + pad_t + pad_b
+    canvas_w = width + pad_l + pad_r
+    canvas = _make_image_canvas(
+        batch, canvas_h, canvas_w, channels, fill, image_bhwc.dtype, image_bhwc.device
+    )
+    canvas[:, pad_t : pad_t + height, pad_l : pad_l + width, :] = image_bhwc
+    return canvas
+
+
+def _compose_padded(
     image: torch.Tensor,
     mask: torch.Tensor | None,
-    canvas_h: int,
-    canvas_w: int,
-    top: int,
-    left: int,
+    pad_l: int,
+    pad_r: int,
+    pad_t: int,
+    pad_b: int,
+    fill_mode: str,
     fill_color: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Paste image/mask onto a filled canvas at (top, left)."""
-    batch, height, width, channels = image.shape
-    fill = _fill_vector(channels, fill_color)
-    canvas = _make_image_canvas(
-        batch, canvas_h, canvas_w, channels, fill, image.dtype, image.device
-    )
-    canvas[:, top : top + height, left : left + width, :] = image
-
+    """Pad image with fill_mode; mask margins stay zeros (inpaint semantics)."""
+    batch, height, width, _channels = image.shape
+    canvas = _pad_image(image, pad_l, pad_r, pad_t, pad_b, fill_mode, fill_color)
+    canvas_h = height + max(0, int(pad_t)) + max(0, int(pad_b))
+    canvas_w = width + max(0, int(pad_l)) + max(0, int(pad_r))
     mask_canvas = torch.zeros(
         (batch, canvas_h, canvas_w), dtype=image.dtype, device=image.device
     )
     if mask is not None:
-        mask_canvas[:, top : top + height, left : left + width] = mask.to(
+        pt, pl = max(0, int(pad_t)), max(0, int(pad_l))
+        mask_canvas[:, pt : pt + height, pl : pl + width] = mask.to(
             dtype=image.dtype, device=image.device
         )
     return canvas, mask_canvas
@@ -166,12 +258,13 @@ def _place_on_canvas(
     halign: str,
     valign: str,
     fit: bool,
+    fill_mode: str = "color",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Place image (+ optional mask) onto a canvas of canvas_h x canvas_w.
     If fit=True, scale content to contain within the canvas (may up/downscale).
     """
-    batch, height, width, channels = image.shape
+    _batch, height, width, _channels = image.shape
     content_h, content_w = height, width
     placed = image
     placed_mask = mask
@@ -198,7 +291,11 @@ def _place_on_canvas(
 
     left = _align_offset(content_w, canvas_w, halign)
     top = _align_offset(content_h, canvas_h, valign)
-    return _paste(placed, placed_mask, canvas_h, canvas_w, top, left, fill_color)
+    right = canvas_w - content_w - left
+    bottom = canvas_h - content_h - top
+    return _compose_padded(
+        placed, placed_mask, left, right, top, bottom, fill_mode, fill_color
+    )
 
 
 def _pad_sides(
@@ -209,12 +306,12 @@ def _pad_sides(
     pad_top: int,
     pad_bottom: int,
     fill_color: str,
+    fill_mode: str = "color",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pad image/mask with explicit per-side pixel margins."""
-    _batch, height, width, _channels = image.shape
-    canvas_w = width + pad_left + pad_right
-    canvas_h = height + pad_top + pad_bottom
-    return _paste(image, mask, canvas_h, canvas_w, pad_top, pad_left, fill_color)
+    return _compose_padded(
+        image, mask, pad_left, pad_right, pad_top, pad_bottom, fill_mode, fill_color
+    )
 
 
 class AddMargins311(io.ComfyNode):
@@ -226,11 +323,13 @@ class AddMargins311(io.ComfyNode):
             category="311/Inpaint",
             description=(
                 "Add margins to an image and its mask. "
-                "Default (square_longest): black 1:1 canvas from the longest side, "
-                "then scale_by 1.25, content centered — matches ImageSize→ScaleByAspectRatio→Upscale By→Align. "
-                "Also supports add_margins (px/%) and target_size."
+                "Default (square_longest): 1:1 canvas from the longest side × scale_by 1.25, "
+                "content centered. fill_mode: color / tile / mirror for the margin area."
             ),
-            search_aliases=["pad", "margin", "padding", "inpaint", "expand", "border", "canvas"],
+            search_aliases=[
+                "pad", "margin", "padding", "inpaint", "expand", "border",
+                "canvas", "tile", "mirror", "reflect",
+            ],
             inputs=[
                 io.Image.Input(id="image", display_name="image"),
                 io.Mask.Input(id="mask", optional=True, display_name="mask"),
@@ -367,12 +466,23 @@ class AddMargins311(io.ComfyNode):
                     display_name="target_height",
                     tooltip="Canvas height when size_mode=target_size.",
                 ),
+                io.Combo.Input(
+                    id="fill_mode",
+                    options=["color", "tile", "mirror"],
+                    default="color",
+                    display_name="fill_mode",
+                    tooltip=(
+                        "color: solid fill_color in margins. "
+                        "tile: repeat image (circular). "
+                        "mirror: reflect edges for continuity."
+                    ),
+                ),
                 io.String.Input(
                     id="fill_color",
                     default="#000000",
                     multiline=False,
                     display_name="fill_color",
-                    tooltip="Canvas fill color as #RGB or #RRGGBB.",
+                    tooltip="Canvas fill when fill_mode=color (#RGB / #RRGGBB).",
                 ),
                 io.Combo.Input(
                     id="halign",
@@ -414,6 +524,7 @@ class AddMargins311(io.ComfyNode):
         bottom_unit: str = "pixels",
         target_width: int = 512,
         target_height: int = 512,
+        fill_mode: str = "color",
         fill_color: str = "#000000",
         halign: str = "center",
         valign: str = "center",
@@ -432,8 +543,8 @@ class AddMargins311(io.ComfyNode):
 
         mode = (size_mode or "square_longest").strip().lower()
         layout = (margin_layout or "symmetric").strip().lower()
+        fmode = (fill_mode or "color").strip().lower()
 
-        # Default workflow: square from longest side, then * scale_by, center content
         if mode == "square_longest":
             factor = max(0.01, float(scale_by))
             side = max(width, height)
@@ -446,7 +557,8 @@ class AddMargins311(io.ComfyNode):
                 fill_color,
                 halign,
                 valign,
-                fit=False,  # keep original resolution; only pad (like Image Align)
+                fit=False,
+                fill_mode=fmode,
             )
             return io.NodeOutput(out_image, out_mask)
 
@@ -457,7 +569,7 @@ class AddMargins311(io.ComfyNode):
                 pad_t = _side_to_pixels(top, top_unit, height)
                 pad_b = _side_to_pixels(bottom, bottom_unit, height)
                 out_image, out_mask = _pad_sides(
-                    image, norm_mask, pad_l, pad_r, pad_t, pad_b, fill_color
+                    image, norm_mask, pad_l, pad_r, pad_t, pad_b, fill_color, fmode
                 )
                 return io.NodeOutput(out_image, out_mask)
 
@@ -471,7 +583,7 @@ class AddMargins311(io.ComfyNode):
             pad_t = eh // 2
             pad_b = eh - pad_t
             out_image, out_mask = _pad_sides(
-                image, norm_mask, pad_l, pad_r, pad_t, pad_b, fill_color
+                image, norm_mask, pad_l, pad_r, pad_t, pad_b, fill_color, fmode
             )
             return io.NodeOutput(out_image, out_mask)
 
@@ -487,5 +599,6 @@ class AddMargins311(io.ComfyNode):
             halign,
             valign,
             fit=True,
+            fill_mode=fmode,
         )
         return io.NodeOutput(out_image, out_mask)
